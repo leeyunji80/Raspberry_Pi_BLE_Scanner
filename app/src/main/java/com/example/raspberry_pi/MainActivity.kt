@@ -1,5 +1,6 @@
 package com.example.raspberry_pi
 
+import android.annotation.SuppressLint
 import android.Manifest
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothManager
@@ -9,11 +10,14 @@ import android.bluetooth.le.ScanFilter
 import android.bluetooth.le.ScanResult
 import android.bluetooth.le.ScanSettings
 import android.content.ContentValues
+import android.content.Context
 import android.content.pm.PackageManager
+import android.location.LocationManager
 import android.os.Build
 import android.os.Bundle
 import android.os.Environment
 import android.os.ParcelUuid
+import android.provider.Settings
 import android.provider.MediaStore
 import android.widget.Toast
 import androidx.activity.ComponentActivity
@@ -35,6 +39,9 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.app.ActivityCompat
 import com.example.raspberry_pi.ui.theme.Raspberry_PiTheme
+import retrofit2.Call
+import retrofit2.Callback
+import retrofit2.Response
 import java.io.File
 import java.io.FileOutputStream
 import java.io.FileWriter
@@ -56,6 +63,12 @@ class MainActivity : ComponentActivity() {
 
     private val deviceMap = mutableStateMapOf<String, BleDevice>()
     private val logList = mutableStateListOf<String>()
+
+    // 마지막으로 수신된 유효한 센서 데이터 (SEND 버튼이 이걸 서버로 전송함)
+    private var lastValidDevice: BleDevice? = null
+
+    private var teamNumber by mutableStateOf("")
+    private var sensorName by mutableStateOf("")
 
     private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
@@ -86,7 +99,13 @@ class MainActivity : ComponentActivity() {
             val serviceData = scanRecord?.getServiceData(ParcelUuid.fromString(targetUuid))
             val rawDataText = serviceData?.joinToString(prefix = "[", postfix = "]") { it.toInt().toString() } ?: ""
             val sensorPacket = SensorPacket.parse(serviceData)
-            deviceMap[address] = BleDevice(name, address, rssi, uuid, scanRecord, sensorPacket)
+
+            val bleDevice = BleDevice(name, address, rssi, uuid, scanRecord, sensorPacket)
+            deviceMap[address] = bleDevice
+
+            if (sensorPacket != null) {
+                lastValidDevice = bleDevice
+            }
 
             val timestamp = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.KOREA).format(Date())
             saveToCsv(timestamp, name, address, rssi, uuid, rawDataText, sensorPacket)
@@ -113,10 +132,15 @@ class MainActivity : ComponentActivity() {
                         devices = deviceMap.values.toList(),
                         logs = logList,
                         isScanning = isScanning,
+                        teamNumber = teamNumber,
+                        sensorName = sensorName,
+                        onTeamNumberChange = { teamNumber = it },
+                        onSensorNameChange = { sensorName = it },
                         onScanClick = { startBleScan() },
                         onStopClick = { stopBleScan() },
                         onSaveClick = { exportCsvToDownloads() },
-                        onRefreshClick = { refreshRecords() }
+                        onRefreshClick = { refreshRecords() },
+                        onSendClick = { sendToServer() }
                     )
                 }
             }
@@ -231,6 +255,7 @@ class MainActivity : ComponentActivity() {
             return
         }
         deviceMap.clear()
+        lastValidDevice = null
         appendLog("스캔 기록과 앱 내부 CSV 데이터를 지웠습니다.")
     }
 
@@ -297,7 +322,6 @@ class MainActivity : ComponentActivity() {
             }
 
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                // Android 10 이상: MediaStore를 통해 다운로드 폴더에 저장
                 val resolver = contentResolver
                 val contentValues = ContentValues().apply {
                     put(MediaStore.Downloads.DISPLAY_NAME, csvFileName)
@@ -317,7 +341,6 @@ class MainActivity : ComponentActivity() {
                     }
                 }
             } else {
-                // Android 9 이하: 레거시 방식으로 직접 복사
                 val downloadsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
                 val destFile = File(downloadsDir, csvFileName)
                 FileOutputStream(destFile).use { outputStream ->
@@ -334,6 +357,78 @@ class MainActivity : ComponentActivity() {
             appendLog("다운로드 폴더 저장 중 오류: ${e.message}")
         }
     }
+
+    // 마지막 위치 정보 가져오기 (실패 시 0.0, 0.0)
+    private fun getLastKnownLocation(): Pair<Double, Double> {
+        if (ActivityCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
+            return Pair(0.0, 0.0)
+        }
+        return try {
+            val locationManager = getSystemService(Context.LOCATION_SERVICE) as LocationManager
+            val providers = locationManager.getProviders(true)
+            for (provider in providers) {
+                val location = locationManager.getLastKnownLocation(provider)
+                if (location != null) {
+                    return Pair(location.latitude, location.longitude)
+                }
+            }
+            Pair(0.0, 0.0)
+        } catch (e: SecurityException) {
+            Pair(0.0, 0.0)
+        }
+    }
+
+    // SEND 버튼: 가장 최근에 수신한 유효한 센서 데이터를 서버로 전송
+    @SuppressLint("HardwareIds")
+    private fun sendToServer() {
+        val device = lastValidDevice
+        val packet = device?.sensorPacket
+
+        if (device == null || packet == null) {
+            appendLog("전송할 유효한 센서 데이터가 없습니다. 먼저 SCAN으로 데이터를 수신해주세요.")
+            return
+        }
+        if (teamNumber.isBlank() || sensorName.isBlank()) {
+            appendLog("팀 번호와 센서 이름을 입력해주세요.")
+            return
+        }
+
+        val (lat, lon) = getLastKnownLocation()
+        val senderId = Settings.Secure.getString(contentResolver, Settings.Secure.ANDROID_ID) ?: "unknown"
+
+        val request = SensorRequest(
+            team = teamNumber,
+            sensor = sensorName,
+            mac = device.address,
+            temp = packet.temperature,
+            humidity = packet.humidity,
+            AQI = packet.aqi,
+            TVOC = packet.tvoc,
+            eCO2 = packet.eco2,
+            timestamp = packet.timestamp,
+            lat = lat,
+            lon = lon,
+            sender = senderId
+        )
+
+        appendLog("서버로 데이터 전송 중...")
+
+        RetrofitClient.api.sendSensorData(request).enqueue(object : Callback<SensorResponse> {
+            override fun onResponse(call: Call<SensorResponse>, response: Response<SensorResponse>) {
+                if (response.isSuccessful) {
+                    val body = response.body()
+                    appendLog("전송 성공: ${body?.result} - ${body?.message}")
+                    Toast.makeText(this@MainActivity, "서버 전송 성공", Toast.LENGTH_SHORT).show()
+                } else {
+                    appendLog("전송 실패: HTTP ${response.code()}")
+                }
+            }
+
+            override fun onFailure(call: Call<SensorResponse>, t: Throwable) {
+                appendLog("전송 오류: ${t.message}")
+            }
+        })
+    }
 }
 
 @Composable
@@ -342,10 +437,15 @@ fun BleScannerScreen(
     devices: List<BleDevice>,
     logs: List<String>,
     isScanning: Boolean,
+    teamNumber: String,
+    sensorName: String,
+    onTeamNumberChange: (String) -> Unit,
+    onSensorNameChange: (String) -> Unit,
     onScanClick: () -> Unit,
     onStopClick: () -> Unit,
     onSaveClick: () -> Unit,
-    onRefreshClick: () -> Unit
+    onRefreshClick: () -> Unit,
+    onSendClick: () -> Unit
 ) {
     Column(modifier = modifier.fillMaxSize().padding(8.dp)) {
 
@@ -364,14 +464,34 @@ fun BleScannerScreen(
             modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
             horizontalArrangement = Arrangement.spacedBy(4.dp)
         ) {
+            OutlinedTextField(
+                value = teamNumber,
+                onValueChange = onTeamNumberChange,
+                label = { Text("팀 번호") },
+                singleLine = true,
+                modifier = Modifier.weight(1f)
+            )
+            OutlinedTextField(
+                value = sensorName,
+                onValueChange = onSensorNameChange,
+                label = { Text("센서 이름") },
+                singleLine = true,
+                modifier = Modifier.weight(1f)
+            )
+        }
+
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+            horizontalArrangement = Arrangement.spacedBy(4.dp)
+        ) {
             Button(onClick = onScanClick, contentPadding = PaddingValues(horizontal = 4.dp), modifier = Modifier.weight(1f)) {
-                Text("SCAN")
+                Text("SCAN", fontSize = 12.sp)
             }
             Button(onClick = onStopClick, contentPadding = PaddingValues(horizontal = 4.dp), modifier = Modifier.weight(1f)) {
-                Text("STOP")
+                Text("STOP", fontSize = 12.sp)
             }
             Button(onClick = onSaveClick, contentPadding = PaddingValues(horizontal = 4.dp), modifier = Modifier.weight(1f)) {
-                Text("SAVE")
+                Text("SAVE", fontSize = 12.sp)
             }
             Button(
                 onClick = onRefreshClick,
@@ -379,7 +499,15 @@ fun BleScannerScreen(
                 contentPadding = PaddingValues(horizontal = 4.dp),
                 modifier = Modifier.weight(1f)
             ) {
-                Text("REFRESH", fontSize = 12.sp)
+                Text("REFRESH", fontSize = 10.sp)
+            }
+            Button(
+                onClick = onSendClick,
+                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2E7D32)),
+                contentPadding = PaddingValues(horizontal = 4.dp),
+                modifier = Modifier.weight(1f)
+            ) {
+                Text("SEND", fontSize = 12.sp)
             }
         }
 
