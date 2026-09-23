@@ -1,5 +1,6 @@
 package com.example.raspberry_pi
 
+import com.google.gson.JsonObject
 import retrofit2.Call
 import retrofit2.http.Body
 import retrofit2.http.POST
@@ -17,14 +18,19 @@ data class SensorRequest(
     val timestamp: Long,
     val lat: Double,
     val lon: Double,
-    val sender: String
+    val sender: String,
+    val raw: String
 )
 
 
 data class SensorResponse(
     val result: String?,
     val message: String?,
-    val received_data: ReceivedData?
+    val received_data: ReceivedData?,
+    val verified: Boolean?,
+    val status: String?,
+    val detail: String?,
+    val expected: JsonObject?
 )
 
 data class ReceivedData(

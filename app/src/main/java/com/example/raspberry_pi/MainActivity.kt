@@ -11,6 +11,7 @@ import android.bluetooth.le.ScanResult
 import android.bluetooth.le.ScanSettings
 import android.content.ContentValues
 import android.content.Context
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.location.LocationManager
 import android.os.Build
@@ -35,6 +36,7 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.app.ActivityCompat
@@ -80,6 +82,16 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private val bluetoothEnableLauncher = registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) {
+        if (bluetoothAdapter?.isEnabled == true) {
+            appendLog("블루투스가 켜졌습니다. SCAN을 다시 눌러주세요.")
+        } else {
+            appendLog("BLE 스캔을 사용하려면 블루투스를 켜야 합니다.")
+        }
+    }
+
     private val scanCallback = object : ScanCallback() {
         override fun onScanResult(callbackType: Int, result: ScanResult) {
             if (!isScanning) return
@@ -99,11 +111,12 @@ class MainActivity : ComponentActivity() {
             val serviceData = scanRecord?.getServiceData(ParcelUuid.fromString(targetUuid))
             val rawDataText = serviceData?.joinToString(prefix = "[", postfix = "]") { it.toInt().toString() } ?: ""
             val sensorPacket = SensorPacket.parse(serviceData)
+            val rawHex = SensorPacket.verifiedRawHex(serviceData)
 
-            val bleDevice = BleDevice(name, address, rssi, uuid, scanRecord, sensorPacket)
+            val bleDevice = BleDevice(name, address, rssi, uuid, scanRecord, sensorPacket, rawHex)
             deviceMap[address] = bleDevice
 
-            if (sensorPacket != null) {
+            if (sensorPacket != null && rawHex != null) {
                 lastValidDevice = bleDevice
             }
 
@@ -192,11 +205,11 @@ class MainActivity : ComponentActivity() {
         }
         if (!adapter.isEnabled) {
             try {
-                adapter.enable()
+                bluetoothEnableLauncher.launch(Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE))
             } catch (e: SecurityException) {
                 appendLog("블루투스 활성화 권한이 없습니다.")
             }
-            appendLog("블루투스가 꺼져 있어 활성화를 요청했습니다. 다시 SCAN을 눌러주세요.")
+            appendLog("블루투스 활성화를 요청했습니다.")
             return
         }
 
@@ -383,9 +396,10 @@ class MainActivity : ComponentActivity() {
     private fun sendToServer() {
         val device = lastValidDevice
         val packet = device?.sensorPacket
+        val rawHex = device?.rawHex
 
-        if (device == null || packet == null) {
-            appendLog("전송할 유효한 센서 데이터가 없습니다. 먼저 SCAN으로 데이터를 수신해주세요.")
+        if (device == null || packet == null || rawHex == null) {
+            appendLog("전송할 21바이트 센서 패킷이 없습니다. HMAC 태그가 포함된 데이터를 먼저 수신해주세요.")
             return
         }
         if (teamNumber.isBlank() || sensorName.isBlank()) {
@@ -397,8 +411,8 @@ class MainActivity : ComponentActivity() {
         val senderId = Settings.Secure.getString(contentResolver, Settings.Secure.ANDROID_ID) ?: "unknown"
 
         val request = SensorRequest(
-            team = teamNumber,
-            sensor = sensorName,
+            team = teamNumber.trim(),
+            sensor = sensorName.trim(),
             mac = device.address,
             temp = packet.temperature,
             humidity = packet.humidity,
@@ -408,7 +422,8 @@ class MainActivity : ComponentActivity() {
             timestamp = packet.timestamp,
             lat = lat,
             lon = lon,
-            sender = senderId
+            sender = senderId,
+            raw = rawHex
         )
 
         appendLog("서버로 데이터 전송 중...")
@@ -417,10 +432,24 @@ class MainActivity : ComponentActivity() {
             override fun onResponse(call: Call<SensorResponse>, response: Response<SensorResponse>) {
                 if (response.isSuccessful) {
                     val body = response.body()
-                    appendLog("전송 성공: ${body?.result} - ${body?.message}")
-                    Toast.makeText(this@MainActivity, "서버 전송 성공", Toast.LENGTH_SHORT).show()
+                    if (body?.verified == true) {
+                        appendLog("검증 성공: ${body.message ?: body.result.orEmpty()}")
+                        Toast.makeText(this@MainActivity, "서버 검증 성공", Toast.LENGTH_SHORT).show()
+                    } else {
+                        appendLog("검증 실패: ${formatServerResponse(body)}")
+                        Toast.makeText(this@MainActivity, "서버 검증 실패", Toast.LENGTH_SHORT).show()
+                    }
                 } else {
-                    appendLog("전송 실패: HTTP ${response.code()}")
+                    val errorText = response.errorBody()?.string()
+                    val errorResponse = errorText?.let {
+                        runCatching { RetrofitClient.gson.fromJson(it, SensorResponse::class.java) }.getOrNull()
+                    }
+                    val reason = if (errorResponse != null) {
+                        formatServerResponse(errorResponse)
+                    } else {
+                        errorText?.takeIf { it.isNotBlank() } ?: "응답 내용 없음"
+                    }
+                    appendLog("전송 실패: HTTP ${response.code()} - $reason")
                 }
             }
 
@@ -429,6 +458,19 @@ class MainActivity : ComponentActivity() {
             }
         })
     }
+
+    private fun formatServerResponse(response: SensorResponse?): String {
+        if (response == null) return "응답 본문 없음"
+        return listOfNotNull(
+            response.status?.takeIf { it.isNotBlank() },
+            response.detail?.takeIf { it.isNotBlank() },
+            response.message?.takeIf { it.isNotBlank() },
+            response.expected?.let { "expected=$it" }
+        ).distinct().joinToString(" / ").ifBlank {
+            response.result ?: "알 수 없는 검증 결과"
+        }
+    }
+
 }
 
 @Composable
@@ -549,5 +591,47 @@ fun BleScannerScreen(
         ) {
             logs.forEach { line -> Text(text = line, fontSize = 12.sp) }
         }
+    }
+}
+
+@Preview(showBackground = true, showSystemUi = true)
+@Composable
+private fun BleScannerScreenPreview() {
+    val sampleDevice = BleDevice(
+        name = "environment_sensor",
+        address = "D8:3A:DD:C1:89:2E",
+        rssi = -62,
+        uuid = "0000181a-0000-1000-8000-00805f9b34fb",
+        scanRecord = null,
+        sensorPacket = SensorPacket(
+            temperature = 28.91f,
+            humidity = 45.09f,
+            aqi = 2,
+            tvoc = 90,
+            eco2 = 532,
+            timestamp = 1789869595L
+        ),
+        rawHex = "4b0b9d11025a0014021b3eaf6ad1a00203a9d65cff"
+    )
+
+    Raspberry_PiTheme {
+        BleScannerScreen(
+            devices = listOf(sampleDevice),
+            logs = listOf(
+                "[12:00:05] 검증 성공: Data received successfully.",
+                "[12:00:04] 서버로 데이터 전송 중...",
+                "[12:00:00] BLE 스캔을 시작했습니다."
+            ),
+            isScanning = false,
+            teamNumber = "9",
+            sensorName = "environment_sensor",
+            onTeamNumberChange = {},
+            onSensorNameChange = {},
+            onScanClick = {},
+            onStopClick = {},
+            onSaveClick = {},
+            onRefreshClick = {},
+            onSendClick = {}
+        )
     }
 }

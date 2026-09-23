@@ -13,8 +13,12 @@ data class SensorPacket(
     val timestamp: Long
 ) {
     companion object {
+        const val VALUE_LENGTH = 13
+        const val TAG_LENGTH = 8
+        const val VERIFIED_PACKET_LENGTH = VALUE_LENGTH + TAG_LENGTH
+
         fun parse(data: ByteArray?): SensorPacket? {
-            if (data == null || data.size < 13) return null
+            if (data == null || data.size < VALUE_LENGTH) return null
             val buf = ByteBuffer.wrap(data).order(ByteOrder.LITTLE_ENDIAN)
             val temperature = buf.short / 100.0f
             val humidity = (buf.short.toInt() and 0xFFFF) / 100.0f
@@ -23,6 +27,13 @@ data class SensorPacket(
             val eco2 = buf.short.toInt() and 0xFFFF
             val timestamp = buf.int.toLong() and 0xFFFFFFFFL
             return SensorPacket(temperature, humidity, aqi, tvoc, eco2, timestamp)
+        }
+
+        fun verifiedRawHex(data: ByteArray?): String? {
+            if (data == null || data.size != VERIFIED_PACKET_LENGTH) return null
+            return data.joinToString(separator = "") { byte ->
+                "%02x".format(byte.toInt() and 0xFF)
+            }
         }
     }
 

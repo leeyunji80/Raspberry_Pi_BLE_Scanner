@@ -7,9 +7,9 @@ import retrofit2.converter.scalars.ScalarsConverterFactory
 
 object RetrofitClient {
     private const val BASE_URL = "http://203.255.81.72:10021/"
+    val gson = GsonBuilder().setLenient().create()
 
     val api: SensorApiService by lazy {
-        val gson = GsonBuilder().setLenient().create()
         val retrofit = Retrofit.Builder()
             .baseUrl(BASE_URL)
             .addConverterFactory(ScalarsConverterFactory.create())

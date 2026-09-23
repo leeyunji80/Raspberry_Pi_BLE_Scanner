@@ -11,17 +11,20 @@ data class BleDevice(
     val rssi: Int,
     val uuid: String?,
     val scanRecord: ScanRecord?,
-    val sensorPacket: SensorPacket?
+    val sensorPacket: SensorPacket?,
+    val rawHex: String?
 ) {
     fun toDisplayString(): String {
         val nameText = name ?: "(이름 없음)"
         val uuidText = uuid ?: "알 수 없음"
         val rawText = scanRecord?.toString() ?: "ScanRecord 없음"
+        val verificationText = rawHex?.let { "검증용 RAW (21바이트): $it" }
+            ?: "검증용 RAW 없음: 21바이트 패킷이 아닙니다."
         val sensorText = sensorPacket?.let { packet ->
             val measuredAt = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.KOREA)
                 .format(Date(packet.timestamp * 1000))
             "${packet}\n측정 시각: $measuredAt"
         } ?: "센서 데이터 없음 또는 형식 오류"
-        return "$nameText\nMAC: $address\nUUID: $uuidText\nRSSI: $rssi dBm\n$rawText\n$sensorText"
+        return "$nameText\nMAC: $address\nUUID: $uuidText\nRSSI: $rssi dBm\n$verificationText\n$rawText\n$sensorText"
     }
 }
