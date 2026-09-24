@@ -6,7 +6,6 @@ import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothManager
 import android.bluetooth.le.BluetoothLeScanner
 import android.bluetooth.le.ScanCallback
-import android.bluetooth.le.ScanFilter
 import android.bluetooth.le.ScanResult
 import android.bluetooth.le.ScanSettings
 import android.content.ContentValues
@@ -97,19 +96,25 @@ class MainActivity : ComponentActivity() {
             if (!isScanning) return
             val device = result.device
             val scanRecord = result.scanRecord
+
+            // 시스템 ScanFilter 대신 여기서 직접 Service Data 유무로 걸러냄
+            // (라즈베리파이가 광고 UUID 목록 필드를 안 쓰고 Service Data 필드에만
+            //  UUID+데이터를 싣는 구조로 바뀐 것으로 보여, 시스템 필터가 매칭을 못 함)
+            val serviceData = scanRecord?.getServiceData(ParcelUuid.fromString(targetUuid))
+            if (serviceData == null) return  // 우리 센서가 아니면 무시
+
             val rssi = result.rssi
             val address = device.address
 
             val name = try {
-                device.name ?: scanRecord?.deviceName
+                device.name ?: scanRecord.deviceName
             } catch (e: SecurityException) {
-                scanRecord?.deviceName
+                scanRecord.deviceName
             }
 
-            val uuid = scanRecord?.serviceUuids?.firstOrNull()?.toString() ?: targetUuid
+            val uuid = scanRecord.serviceUuids?.firstOrNull()?.toString() ?: targetUuid
 
-            val serviceData = scanRecord?.getServiceData(ParcelUuid.fromString(targetUuid))
-            val rawDataText = serviceData?.joinToString(prefix = "[", postfix = "]") { it.toInt().toString() } ?: ""
+            val rawDataText = serviceData.joinToString(prefix = "[", postfix = "]") { it.toInt().toString() }
             val sensorPacket = SensorPacket.parse(serviceData)
             val rawHex = SensorPacket.verifiedRawHex(serviceData)
 
@@ -220,19 +225,15 @@ class MainActivity : ComponentActivity() {
             return
         }
 
-        val filters = listOf(
-            ScanFilter.Builder()
-                .setServiceUuid(ParcelUuid.fromString(targetUuid))
-                .build()
-        )
-
+        // 시스템 ScanFilter는 사용하지 않고(라즈베리파이 패킷 구조와 매칭이 안 되는 문제 회피),
+        // 모든 기기를 받은 뒤 onScanResult 안에서 우리 UUID의 Service Data 유무로 직접 걸러냄
         val settings = ScanSettings.Builder()
             .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
             .setCallbackType(ScanSettings.CALLBACK_TYPE_ALL_MATCHES)
             .build()
 
         try {
-            scanner.startScan(filters, settings, scanCallback)
+            scanner.startScan(emptyList(), settings, scanCallback)
             isScanning = true
             appendLog("BLE 스캔을 시작했습니다.")
         } catch (e: SecurityException) {
