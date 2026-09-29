@@ -83,6 +83,27 @@ class SensorCsvTest {
     }
 
     @Test
+    fun transmissionTestModesOnlyChangeTheIntendedField() {
+        val raw = "470b501102bc00a602bb1faa6ad1a00203a9d65cff"
+        val temperature = 28.87f
+
+        val normal = applyTransmissionMode(TransmissionMode.NORMAL, raw, temperature)
+        val tampered = applyTransmissionMode(TransmissionMode.RAW_TAMPERED, raw, temperature)
+        val mismatch = applyTransmissionMode(TransmissionMode.VALUE_MISMATCH, raw, temperature)
+        val badRaw = applyTransmissionMode(TransmissionMode.BAD_RAW, raw, temperature)
+
+        assertEquals(raw, normal.raw)
+        assertEquals(temperature, normal.temperature)
+        assertEquals(raw.length, tampered.raw.length)
+        assertTrue(raw != tampered.raw)
+        assertEquals(temperature, tampered.temperature)
+        assertEquals(raw, mismatch.raw)
+        assertEquals(temperature + 10.0f, mismatch.temperature)
+        assertEquals(raw.length - 2, badRaw.raw.length)
+        assertEquals(temperature, badRaw.temperature)
+    }
+
+    @Test
     fun csvRowAddsParsedColumnsAndPreservesRawBytes() {
         val raw = sampleBytes.joinToString(prefix = "[", postfix = "]")
         val row = SensorCsv.row(

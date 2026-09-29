@@ -70,6 +70,7 @@ class MainActivity : ComponentActivity() {
 
     private var teamNumber by mutableStateOf("")
     private var sensorName by mutableStateOf("")
+    private var transmissionMode by mutableStateOf(TransmissionMode.NORMAL)
 
     private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
@@ -152,8 +153,10 @@ class MainActivity : ComponentActivity() {
                         isScanning = isScanning,
                         teamNumber = teamNumber,
                         sensorName = sensorName,
+                        transmissionMode = transmissionMode,
                         onTeamNumberChange = { teamNumber = it },
                         onSensorNameChange = { sensorName = it },
+                        onTransmissionModeChange = { transmissionMode = it },
                         onScanClick = { startBleScan() },
                         onStopClick = { stopBleScan() },
                         onSaveClick = { exportCsvToDownloads() },
@@ -410,12 +413,14 @@ class MainActivity : ComponentActivity() {
 
         val (lat, lon) = getLastKnownLocation()
         val senderId = Settings.Secure.getString(contentResolver, Settings.Secure.ANDROID_ID) ?: "unknown"
+        val selectedMode = transmissionMode
+        val transmissionValues = applyTransmissionMode(selectedMode, rawHex, packet.temperature)
 
         val request = SensorRequest(
             team = teamNumber.trim(),
             sensor = sensorName.trim(),
             mac = device.address,
-            temp = packet.temperature,
+            temp = transmissionValues.temperature,
             humidity = packet.humidity,
             AQI = packet.aqi,
             TVOC = packet.tvoc,
@@ -424,10 +429,11 @@ class MainActivity : ComponentActivity() {
             lat = lat,
             lon = lon,
             sender = senderId,
-            raw = rawHex
+            raw = transmissionValues.raw
         )
 
-        appendLog("서버로 데이터 전송 중...")
+        appendLog("서버로 데이터 전송 중... 모드=${selectedMode.displayName}")
+        transmissionMode = TransmissionMode.NORMAL
 
         RetrofitClient.api.sendSensorData(request).enqueue(object : Callback<SensorResponse> {
             override fun onResponse(call: Call<SensorResponse>, response: Response<SensorResponse>) {
@@ -482,8 +488,10 @@ fun BleScannerScreen(
     isScanning: Boolean,
     teamNumber: String,
     sensorName: String,
+    transmissionMode: TransmissionMode,
     onTeamNumberChange: (String) -> Unit,
     onSensorNameChange: (String) -> Unit,
+    onTransmissionModeChange: (TransmissionMode) -> Unit,
     onScanClick: () -> Unit,
     onStopClick: () -> Unit,
     onSaveClick: () -> Unit,
@@ -552,6 +560,13 @@ fun BleScannerScreen(
             ) {
                 Text("SEND", fontSize = 12.sp)
             }
+        }
+
+        OutlinedButton(
+            onClick = { onTransmissionModeChange(transmissionMode.next()) },
+            modifier = Modifier.fillMaxWidth().padding(top = 4.dp)
+        ) {
+            Text("전송 모드: ${transmissionMode.displayName} (눌러서 변경)")
         }
 
         Text(
@@ -626,8 +641,10 @@ private fun BleScannerScreenPreview() {
             isScanning = false,
             teamNumber = "9",
             sensorName = "environment_sensor",
+            transmissionMode = TransmissionMode.NORMAL,
             onTeamNumberChange = {},
             onSensorNameChange = {},
+            onTransmissionModeChange = {},
             onScanClick = {},
             onStopClick = {},
             onSaveClick = {},
