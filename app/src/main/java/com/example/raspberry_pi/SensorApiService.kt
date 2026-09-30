@@ -1,13 +1,15 @@
 package com.example.raspberry_pi
 
-import com.google.gson.JsonObject
 import retrofit2.Call
 import retrofit2.http.Body
 import retrofit2.http.POST
 
+const val TEAM_API_KEY = "opensrc-team8"
+const val TEAM_LOCAL_NAME = "Opensrc_team8"
+
+// 선언 순서는 서버가 요구하는 JSON payload 순서와 동일하게 유지한다.
 data class SensorRequest(
-    val key: String = "opensrc2026",
-    val team: String,
+    val key: String = TEAM_API_KEY,
     val sensor: String,
     val mac: String,
     val temp: Float,
@@ -18,8 +20,7 @@ data class SensorRequest(
     val timestamp: Long,
     val lat: Double,
     val lon: Double,
-    val sender: String,
-    val raw: String
+    val sender: String
 )
 
 
@@ -27,10 +28,8 @@ data class SensorResponse(
     val result: String?,
     val message: String?,
     val received_data: ReceivedData?,
-    val verified: Boolean?,
     val status: String?,
-    val detail: String?,
-    val expected: JsonObject?
+    val detail: String?
 )
 
 data class ReceivedData(
@@ -39,6 +38,6 @@ data class ReceivedData(
 )
 
 interface SensorApiService {
-    @POST("sensor/opensrc/test/")
+    @POST("sensor/opensrc/upload/")
     fun sendSensorData(@Body request: SensorRequest): Call<SensorResponse>
 }

@@ -3,7 +3,6 @@ package com.example.raspberry_pi
 import com.google.gson.Gson
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
-import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class SensorCsvTest {
@@ -24,27 +23,20 @@ class SensorCsvTest {
     }
 
     @Test
-    fun verifiedRawRequiresAllTwentyOneBytesAndUsesUnsignedHex() {
-        val fullPacket = sampleBytes + byteArrayOf(
-            0xD1.toByte(), 0xA0.toByte(), 0x02, 0x03, 0xA9.toByte(), 0xD6.toByte(), 0x5C, 0xFF.toByte()
-        )
-
+    fun serviceDataRequiresExactlyThirteenBytesAndUsesUnsignedHex() {
         assertEquals(
-            "470b501102bc00a602bb1faa6ad1a00203a9d65cff",
-            SensorPacket.verifiedRawHex(fullPacket)
+            "470b501102bc00a602bb1faa6a",
+            SensorPacket.serviceDataHex(sampleBytes)
         )
-        assertEquals(SensorPacket.VERIFIED_PACKET_LENGTH * 2, SensorPacket.verifiedRawHex(fullPacket)!!.length)
-        assertTrue(SensorPacket.verifiedRawHex(fullPacket)!!.matches(Regex("[0-9a-f]{42}")))
-        assertNull(SensorPacket.verifiedRawHex(fullPacket.copyOf(20)))
-        assertNull(SensorPacket.verifiedRawHex(fullPacket + 0x00))
+        assertEquals(SensorPacket.PACKET_LENGTH * 2, SensorPacket.serviceDataHex(sampleBytes)!!.length)
+        assertNull(SensorPacket.serviceDataHex(sampleBytes.copyOf(12)))
+        assertNull(SensorPacket.serviceDataHex(sampleBytes + 0x00))
     }
 
     @Test
-    fun apiRequestContainsTheExactRawHexAndRequiredFieldNames() {
-        val raw = "470b501102bc00a602bb1faa6ad1a00203a9d65cff"
+    fun apiRequestUsesTheRequiredFieldNamesAndOrder() {
         val request = SensorRequest(
-            team = "9",
-            sensor = "environment_sensor",
+            sensor = TEAM_LOCAL_NAME,
             mac = "D8:3A:DD:C1:89:2E",
             temp = 28.87f,
             humidity = 44.32f,
@@ -54,32 +46,32 @@ class SensorCsvTest {
             timestamp = 1789534139L,
             lat = 36.629011,
             lon = 127.457092,
-            sender = "android-id",
-            raw = raw
+            sender = "android-id"
         )
 
         val json = Gson().toJson(request)
-        assertTrue(json.contains("\"key\":\"opensrc2026\""))
-        assertTrue(json.contains("\"AQI\":2"))
-        assertTrue(json.contains("\"TVOC\":188"))
-        assertTrue(json.contains("\"eCO2\":678"))
-        assertTrue(json.contains("\"raw\":\"$raw\""))
+        assertEquals(
+            "{\"key\":\"opensrc-team8\",\"sensor\":\"Opensrc_team8\",\"mac\":\"D8:3A:DD:C1:89:2E\"," +
+                "\"temp\":28.87,\"humidity\":44.32,\"AQI\":2,\"TVOC\":188,\"eCO2\":678," +
+                "\"timestamp\":1789534139,\"lat\":36.629011,\"lon\":127.457092,\"sender\":\"android-id\"}",
+            json
+        )
     }
 
     @Test
-    fun serverVerificationFieldsAreParsedForSuccessAndFailure() {
+    fun serverUploadStatusIsParsedForSuccessAndRangeWarning() {
         val success = Gson().fromJson(
-            """{"result":"Success","message":"ok","verified":true}""",
+            """{"result":"Success","message":"saved","status":"ok"}""",
             SensorResponse::class.java
         )
-        val failure = Gson().fromJson(
-            """{"result":"Fail","verified":false,"status":"bad_tag","detail":"태그 검증 실패"}""",
+        val warning = Gson().fromJson(
+            """{"result":"Success","status":"out_of_range","detail":"센서값 범위 확인"}""",
             SensorResponse::class.java
         )
 
-        assertEquals(true, success.verified)
-        assertEquals("bad_tag", failure.status)
-        assertEquals("태그 검증 실패", failure.detail)
+        assertEquals("ok", success.status)
+        assertEquals("out_of_range", warning.status)
+        assertEquals("센서값 범위 확인", warning.detail)
     }
 
     @Test

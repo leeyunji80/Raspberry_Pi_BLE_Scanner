@@ -39,7 +39,12 @@ import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.app.ActivityCompat
+import androidx.lifecycle.lifecycleScope
 import com.example.raspberry_pi.ui.theme.Raspberry_PiTheme
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 import retrofit2.Call
 import retrofit2.Callback
 import retrofit2.Response
@@ -57,6 +62,7 @@ class MainActivity : ComponentActivity() {
 
     private val targetUuid = "0000181a-0000-1000-8000-00805f9b34fb"
     private val csvFileName = "ble_data.csv"
+    private val autoUploadIntervalMs = 10_000L
 
     private var bluetoothAdapter: BluetoothAdapter? = null
     private var bluetoothLeScanner: BluetoothLeScanner? = null
@@ -65,11 +71,12 @@ class MainActivity : ComponentActivity() {
     private val deviceMap = mutableStateMapOf<String, BleDevice>()
     private val logList = mutableStateListOf<String>()
 
-    // 마지막으로 수신된 유효한 센서 데이터 (SEND 버튼이 이걸 서버로 전송함)
+    // 마지막으로 수신된 유효한 13바이트 센서 데이터
     private var lastValidDevice: BleDevice? = null
-
-    private var teamNumber by mutableStateOf("")
-    private var sensorName by mutableStateOf("")
+    private var autoUploadJob: Job? = null
+    private var lastUploadedTimestamp: Long? = null
+    private var lastRejectedTimestamp: Long? = null
+    private var uploadInProgress = false
 
     private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
@@ -106,22 +113,24 @@ class MainActivity : ComponentActivity() {
             val rssi = result.rssi
             val address = device.address
 
-            val name = try {
-                device.name ?: scanRecord.deviceName
+            // 광고 패킷의 Local Name을 우선 사용해 다른 팀 센서를 확실히 제외한다.
+            val name = scanRecord.deviceName ?: try {
+                device.name
             } catch (e: SecurityException) {
-                scanRecord.deviceName
+                null
             }
+            if (name != TEAM_LOCAL_NAME) return
 
             val uuid = scanRecord.serviceUuids?.firstOrNull()?.toString() ?: targetUuid
 
             val rawDataText = serviceData.joinToString(prefix = "[", postfix = "]") { it.toInt().toString() }
             val sensorPacket = SensorPacket.parse(serviceData)
-            val rawHex = SensorPacket.verifiedRawHex(serviceData)
+            val serviceDataHex = SensorPacket.serviceDataHex(serviceData)
 
-            val bleDevice = BleDevice(name, address, rssi, uuid, scanRecord, sensorPacket, rawHex)
+            val bleDevice = BleDevice(name, address, rssi, uuid, scanRecord, sensorPacket, serviceDataHex)
             deviceMap[address] = bleDevice
 
-            if (sensorPacket != null && rawHex != null) {
+            if (sensorPacket != null) {
                 lastValidDevice = bleDevice
             }
 
@@ -131,6 +140,7 @@ class MainActivity : ComponentActivity() {
 
         override fun onScanFailed(errorCode: Int) {
             isScanning = false
+            stopAutoUpload()
             appendLog("스캔 실패. 오류 코드: $errorCode")
         }
     }
@@ -150,15 +160,11 @@ class MainActivity : ComponentActivity() {
                         devices = deviceMap.values.toList(),
                         logs = logList,
                         isScanning = isScanning,
-                        teamNumber = teamNumber,
-                        sensorName = sensorName,
-                        onTeamNumberChange = { teamNumber = it },
-                        onSensorNameChange = { sensorName = it },
                         onScanClick = { startBleScan() },
                         onStopClick = { stopBleScan() },
                         onSaveClick = { exportCsvToDownloads() },
                         onRefreshClick = { refreshRecords() },
-                        onSendClick = { sendToServer() }
+                        onSendClick = { sendToServer(automatic = false) }
                     )
                 }
             }
@@ -235,13 +241,15 @@ class MainActivity : ComponentActivity() {
         try {
             scanner.startScan(emptyList(), settings, scanCallback)
             isScanning = true
-            appendLog("BLE 스캔을 시작했습니다.")
+            startAutoUpload()
+            appendLog("BLE 스캔과 10초 간격 자동 전송을 시작했습니다.")
         } catch (e: SecurityException) {
             appendLog("권한 부족으로 스캔을 시작할 수 없습니다.")
         }
     }
 
     private fun stopBleScan() {
+        stopAutoUpload()
         val scanner = bluetoothLeScanner
         if (scanner == null || !isScanning) return
         try {
@@ -251,6 +259,23 @@ class MainActivity : ComponentActivity() {
         }
         isScanning = false
         appendLog("BLE 스캔을 중지했습니다.")
+    }
+
+    private fun startAutoUpload() {
+        autoUploadJob?.cancel()
+        autoUploadJob = lifecycleScope.launch {
+            while (isActive) {
+                delay(autoUploadIntervalMs)
+                val timestamp = lastValidDevice?.sensorPacket?.timestamp ?: continue
+                if (timestamp == lastUploadedTimestamp || timestamp == lastRejectedTimestamp) continue
+                sendToServer(automatic = true)
+            }
+        }
+    }
+
+    private fun stopAutoUpload() {
+        autoUploadJob?.cancel()
+        autoUploadJob = null
     }
 
     private fun refreshRecords() {
@@ -270,6 +295,8 @@ class MainActivity : ComponentActivity() {
         }
         deviceMap.clear()
         lastValidDevice = null
+        lastUploadedTimestamp = null
+        lastRejectedTimestamp = null
         appendLog("스캔 기록과 앱 내부 CSV 데이터를 지웠습니다.")
     }
 
@@ -392,19 +419,18 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    // SEND 버튼: 가장 최근에 수신한 유효한 센서 데이터를 서버로 전송
+    // 가장 최근의 유효한 13바이트 센서 데이터를 서버로 전송
     @SuppressLint("HardwareIds")
-    private fun sendToServer() {
-        val device = lastValidDevice
-        val packet = device?.sensorPacket
-        val rawHex = device?.rawHex
-
-        if (device == null || packet == null || rawHex == null) {
-            appendLog("전송할 21바이트 센서 패킷이 없습니다. HMAC 태그가 포함된 데이터를 먼저 수신해주세요.")
+    private fun sendToServer(automatic: Boolean) {
+        if (uploadInProgress) {
+            if (!automatic) appendLog("이미 서버 전송이 진행 중입니다.")
             return
         }
-        if (teamNumber.isBlank() || sensorName.isBlank()) {
-            appendLog("팀 번호와 센서 이름을 입력해주세요.")
+        val device = lastValidDevice
+        val packet = device?.sensorPacket
+
+        if (device == null || packet == null) {
+            if (!automatic) appendLog("전송할 13바이트 센서 패킷이 없습니다. 먼저 SCAN을 눌러주세요.")
             return
         }
 
@@ -412,8 +438,8 @@ class MainActivity : ComponentActivity() {
         val senderId = Settings.Secure.getString(contentResolver, Settings.Secure.ANDROID_ID) ?: "unknown"
 
         val request = SensorRequest(
-            team = teamNumber.trim(),
-            sensor = sensorName.trim(),
+            key = TEAM_API_KEY,
+            sensor = TEAM_LOCAL_NAME,
             mac = device.address,
             temp = packet.temperature,
             humidity = packet.humidity,
@@ -423,22 +449,29 @@ class MainActivity : ComponentActivity() {
             timestamp = packet.timestamp,
             lat = lat,
             lon = lon,
-            sender = senderId,
-            raw = rawHex
+            sender = senderId
         )
 
-        appendLog("서버로 데이터 전송 중...")
+        uploadInProgress = true
+        appendLog("서버로 데이터 전송 중... (${if (automatic) "자동" else "수동"})")
 
         RetrofitClient.api.sendSensorData(request).enqueue(object : Callback<SensorResponse> {
             override fun onResponse(call: Call<SensorResponse>, response: Response<SensorResponse>) {
+                uploadInProgress = false
                 if (response.isSuccessful) {
                     val body = response.body()
-                    if (body?.verified == true) {
-                        appendLog("검증 성공: ${body.message ?: body.result.orEmpty()}")
-                        Toast.makeText(this@MainActivity, "서버 검증 성공", Toast.LENGTH_SHORT).show()
-                    } else {
-                        appendLog("검증 실패: ${formatServerResponse(body)}")
-                        Toast.makeText(this@MainActivity, "서버 검증 실패", Toast.LENGTH_SHORT).show()
+                    when (body?.status) {
+                        "ok" -> {
+                            lastUploadedTimestamp = packet.timestamp
+                            appendLog("서버 저장 성공: ${body.message ?: body.result.orEmpty()}")
+                            if (!automatic) Toast.makeText(this@MainActivity, "서버 저장 성공", Toast.LENGTH_SHORT).show()
+                        }
+                        "out_of_range" -> {
+                            lastUploadedTimestamp = packet.timestamp
+                            appendLog("서버 저장 완료(범위 경고): ${formatServerResponse(body)}")
+                            if (!automatic) Toast.makeText(this@MainActivity, "저장됨: 센서값 범위 확인 필요", Toast.LENGTH_SHORT).show()
+                        }
+                        else -> appendLog("서버 응답 확인 필요: ${formatServerResponse(body)}")
                     }
                 } else {
                     val errorText = response.errorBody()?.string()
@@ -450,11 +483,13 @@ class MainActivity : ComponentActivity() {
                     } else {
                         errorText?.takeIf { it.isNotBlank() } ?: "응답 내용 없음"
                     }
+                    if (response.code() == 400) lastRejectedTimestamp = packet.timestamp
                     appendLog("전송 실패: HTTP ${response.code()} - $reason")
                 }
             }
 
             override fun onFailure(call: Call<SensorResponse>, t: Throwable) {
+                uploadInProgress = false
                 appendLog("전송 오류: ${t.message}")
             }
         })
@@ -465,8 +500,7 @@ class MainActivity : ComponentActivity() {
         return listOfNotNull(
             response.status?.takeIf { it.isNotBlank() },
             response.detail?.takeIf { it.isNotBlank() },
-            response.message?.takeIf { it.isNotBlank() },
-            response.expected?.let { "expected=$it" }
+            response.message?.takeIf { it.isNotBlank() }
         ).distinct().joinToString(" / ").ifBlank {
             response.result ?: "알 수 없는 검증 결과"
         }
@@ -480,10 +514,6 @@ fun BleScannerScreen(
     devices: List<BleDevice>,
     logs: List<String>,
     isScanning: Boolean,
-    teamNumber: String,
-    sensorName: String,
-    onTeamNumberChange: (String) -> Unit,
-    onSensorNameChange: (String) -> Unit,
     onScanClick: () -> Unit,
     onStopClick: () -> Unit,
     onSaveClick: () -> Unit,
@@ -508,16 +538,18 @@ fun BleScannerScreen(
             horizontalArrangement = Arrangement.spacedBy(4.dp)
         ) {
             OutlinedTextField(
-                value = teamNumber,
-                onValueChange = onTeamNumberChange,
+                value = "8",
+                onValueChange = {},
                 label = { Text("팀 번호") },
+                readOnly = true,
                 singleLine = true,
                 modifier = Modifier.weight(1f)
             )
             OutlinedTextField(
-                value = sensorName,
-                onValueChange = onSensorNameChange,
+                value = TEAM_LOCAL_NAME,
+                onValueChange = {},
                 label = { Text("센서 이름") },
+                readOnly = true,
                 singleLine = true,
                 modifier = Modifier.weight(1f)
             )
@@ -553,6 +585,13 @@ fun BleScannerScreen(
                 Text("SEND", fontSize = 12.sp)
             }
         }
+
+        Text(
+            text = if (isScanning) "자동 전송: 실행 중 (10초 간격)" else "자동 전송: 중지됨",
+            color = if (isScanning) Color(0xFF2E7D32) else Color.DarkGray,
+            fontSize = 12.sp,
+            modifier = Modifier.padding(vertical = 6.dp)
+        )
 
         Text(
             text = "Scan Records",
@@ -599,7 +638,7 @@ fun BleScannerScreen(
 @Composable
 private fun BleScannerScreenPreview() {
     val sampleDevice = BleDevice(
-        name = "environment_sensor",
+        name = TEAM_LOCAL_NAME,
         address = "D8:3A:DD:C1:89:2E",
         rssi = -62,
         uuid = "0000181a-0000-1000-8000-00805f9b34fb",
@@ -612,22 +651,18 @@ private fun BleScannerScreenPreview() {
             eco2 = 532,
             timestamp = 1789869595L
         ),
-        rawHex = "4b0b9d11025a0014021b3eaf6ad1a00203a9d65cff"
+        serviceDataHex = "4b0b9d11025a0014021b3eaf6a"
     )
 
     Raspberry_PiTheme {
         BleScannerScreen(
             devices = listOf(sampleDevice),
             logs = listOf(
-                "[12:00:05] 검증 성공: Data received successfully.",
-                "[12:00:04] 서버로 데이터 전송 중...",
-                "[12:00:00] BLE 스캔을 시작했습니다."
+                "[12:00:10] 서버 저장 성공: Data received successfully.",
+                "[12:00:10] 서버로 데이터 전송 중... (자동)",
+                "[12:00:00] BLE 스캔과 10초 간격 자동 전송을 시작했습니다."
             ),
             isScanning = false,
-            teamNumber = "9",
-            sensorName = "environment_sensor",
-            onTeamNumberChange = {},
-            onSensorNameChange = {},
             onScanClick = {},
             onStopClick = {},
             onSaveClick = {},
